@@ -1,0 +1,83 @@
+name: Build ARO VPN (Android)
+on:
+  workflow_dispatch:
+    inputs:
+      abi:
+        description: "CPU: arm64-v8a (most phones) or armeabi-v7a / x86_64 / x86"
+        default: "arm64-v8a"
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ABI: ${{ github.event.inputs.abi || 'arm64-v8a' }}
+      KS_B64: ${{ secrets.APP_KEYSTORE_BASE64 }}
+      STOREPASS: ${{ secrets.APP_KEYSTORE_PASSWORD || 'aropass123' }}
+      KEYALIAS: ${{ secrets.APP_KEYSTORE_ALIAS || 'aro' }}
+      KEYPASS: ${{ secrets.APP_KEY_PASSWORD || 'aropass123' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get v2rayNG (open source engine/app base)
+        run: git clone --recurse-submodules https://github.com/2dust/v2rayNG.git vng
+
+      - name: Rebrand as ARO VPN
+        run: |
+          pip install pillow
+          python3 tools/rebrand.py vng
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platforms;android-37.0 build-tools;37.0.0 platform-tools'
+
+      - name: Install NDK
+        run: |
+          echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --channel=0 --install "ndk;30.0.16248370"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370" >> $GITHUB_ENV
+          sed -i '10i\    ndkVersion = "30.0.16248370"' vng/V2rayNG/app/build.gradle.kts
+
+      - name: Build native tunnel library (hev-socks5-tunnel)
+        working-directory: vng
+        run: bash compile-hevtun.sh
+
+      - name: Copy native libs
+        run: cp -r vng/libs vng/V2rayNG/app/
+
+      - name: Download Xray core (libv2ray.aar)
+        working-directory: vng
+        run: |
+          TAG=$(cd AndroidLibXrayLite && git describe --tags --abbrev=0)
+          echo "libv2ray tag: $TAG"
+          mkdir -p V2rayNG/app/libs
+          curl -fL -o V2rayNG/app/libs/libv2ray.aar "https://github.com/2dust/AndroidLibXrayLite/releases/download/$TAG/libv2ray.aar"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Signing key
+        run: |
+          if [ -n "$KS_B64" ]; then echo "$KS_B64" | base64 -d > $PWD/aro.jks
+          else keytool -genkeypair -keystore $PWD/aro.jks -alias "$KEYALIAS" -keyalg RSA -keysize 2048 -validity 36500 -storepass "$STOREPASS" -keypass "$KEYPASS" -dname "CN=ARO VPN, O=ArrowDeveloper"; fi
+
+      - name: Build APK
+        working-directory: vng/V2rayNG
+        run: |
+          echo "sdk.dir=${ANDROID_HOME}" > local.properties
+          chmod +x gradlew
+          ./gradlew assemblePlaystoreRelease -PABI_FILTERS="$ABI" \
+            -Pandroid.injected.signing.store.file=$GITHUB_WORKSPACE/aro.jks \
+            -Pandroid.injected.signing.store.password="$STOREPASS" \
+            -Pandroid.injected.signing.key.alias="$KEYALIAS" \
+            -Pandroid.injected.signing.key.password="$KEYPASS"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ARO-VPN-apk
+          path: vng/V2rayNG/app/build/outputs/apk/**/release/*.apk
